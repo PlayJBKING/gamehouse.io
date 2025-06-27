@@ -61,7 +61,7 @@ abstract contract GuessGameBase is VRFConsumerBaseV2Plus, ReentrancyGuard, Pausa
     // Chainlink VRF V2.5 configuration
     uint256 private s_subscriptionId;                        // support larger subscription ID
     bytes32 private keyHash;
-    uint32 private callbackGasLimit = 2500000;
+    uint32 private callbackGasLimit = 1000000;
     uint16 private requestConfirmations = 3;
     uint32 private numWords = 1;
     
@@ -74,6 +74,7 @@ abstract contract GuessGameBase is VRFConsumerBaseV2Plus, ReentrancyGuard, Pausa
     event InviteRewardAccumulated(uint256 indexed gameId, address indexed inviter, address indexed invitee, uint256 reward);
     event InviteRewardsReleased(uint256 indexed gameId, uint256 totalRewards);
     event PlatformFeesWithdrawn(address indexed receiver, uint256 amount);
+    event VRFRequestRetried(uint256 indexed gameId);
     
     /**
      * @dev Constructor
@@ -96,8 +97,8 @@ abstract contract GuessGameBase is VRFConsumerBaseV2Plus, ReentrancyGuard, Pausa
         inviteManager = IInviteManager(_inviteManager);
         platformFeeReceiver = msg.sender; // Default: set deployer as fee receiver
         
-        // Initialize first game
-        _startNewGame();
+        // Initialize currentGameId to 0, game will start when first user participates
+        currentGameId = 0;
     }
     
     /**
@@ -120,6 +121,11 @@ abstract contract GuessGameBase is VRFConsumerBaseV2Plus, ReentrancyGuard, Pausa
      * @dev Internal game participation logic
      */
     function _participate() internal {
+        // If no game exists (currentGameId = 0) or current game is finished/refunded, start a new game
+        if (currentGameId == 0 || games[currentGameId].isFinished || games[currentGameId].isRefunded) {
+            _startNewGame();
+        }
+        
         Game storage game = games[currentGameId];
         require(game.players.length < MAX_PLAYERS, "Game is full");
         require(!game.isFinished, "Game is finished");
@@ -250,8 +256,7 @@ abstract contract GuessGameBase is VRFConsumerBaseV2Plus, ReentrancyGuard, Pausa
         
         emit WinnerSelected(gameId, winner, winnerReward);
         
-        // Start new game
-        _startNewGame();
+        // Game completed, wait for next user to start new game
     }
     
     /**
@@ -280,44 +285,28 @@ abstract contract GuessGameBase is VRFConsumerBaseV2Plus, ReentrancyGuard, Pausa
     }
     
     /**
-     * @dev Manually release game rewards (if automatic release fails)
-     */
-    function releaseGameRewards(uint256 gameId) external onlyOwner nonReentrant {
-        Game storage game = games[gameId];
-        require(game.isFinished, "Game not finished");
-        require(!game.rewardsReleased, "Rewards already released");
-        require(!game.isRefunded, "Game was refunded");
-        
-        uint256 totalPrize = ENTRY_FEE * game.players.length;                    // total participation amount
-        uint256 totalInviteRewards = game.totalInviteRewards;                    // total invite rewards
-        uint256 platformFee = (totalPrize * BASE_PLATFORM_FEE_PERCENT) / 100;   // platform fee amount
-        uint256 actualPlatformFee = platformFee - totalInviteRewards;            // actual platform fee
-        uint256 totalToInviteManager = actualPlatformFee + totalInviteRewards;
-        
-        if (totalToInviteManager > 0 && address(inviteManager) != address(0)) {
-            // Collect invite reward distribution information
-            address[] memory inviters;
-            uint256[] memory inviteAmounts;
-            (inviters, inviteAmounts) = _getInviteRewardDistribution(gameId);
-            
-            game.rewardsReleased = true;
-            inviteManager.processGameRewards{value: totalToInviteManager}(
-                gameId,
-                actualPlatformFee,
-                inviters,
-                inviteAmounts
-            );
-            emit InviteRewardsReleased(gameId, totalInviteRewards);
-        }
-    }
-    
-    /**
      * @dev Start new game
      */
     function _startNewGame() internal {
         currentGameId++;
         games[currentGameId].startTime = block.timestamp;
         emit GameStarted(currentGameId, block.timestamp);
+    }
+    
+    /**
+     * @dev Retry VRF request for a game if previous request failed
+     * Only owner can call this function
+     */
+    function retryVRFRequest(uint256 gameId) external onlyOwner nonReentrant {
+        Game storage game = games[gameId];
+        require(!game.isFinished, "Game already finished");
+        require(!game.isRefunded, "Game already refunded");
+        require(game.players.length == MAX_PLAYERS, "Game not full");
+        
+        // Request new randomness
+        _requestRandomness(gameId);
+        
+        emit VRFRequestRetried(gameId);
     }
     
     /**
@@ -341,10 +330,7 @@ abstract contract GuessGameBase is VRFConsumerBaseV2Plus, ReentrancyGuard, Pausa
         
         emit GameRefunded(gameId, playerCount);
         
-        // If it's current game, start new game
-        if (gameId == currentGameId) {
-            _startNewGame();
-        }
+        // Game refunded, wait for next user to start new game
     }
     
     /**
@@ -410,6 +396,12 @@ abstract contract GuessGameBase is VRFConsumerBaseV2Plus, ReentrancyGuard, Pausa
         uint256 timeLeft,
         uint256 totalInviteRewards
     ) {
+        // If no game started yet, return empty state
+        if (currentGameId == 0) {
+            address[] memory emptyPlayers = new address[](0);
+            return (emptyPlayers, 0, false, 0, 0);
+        }
+        
         Game storage game = games[currentGameId];
         uint256 timeLeft_ = 0;
         
